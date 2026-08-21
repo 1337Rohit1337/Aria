@@ -14,3 +14,8 @@ pgvector==0.3.2
 pydantic-settings==2.5.2
 python-dotenv==1.0.1
 numexpr==2.10.1
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.4.1
+sentence-transformers==3.0.1
+wikipedia==1.4.0
+pyowm==3.3.0

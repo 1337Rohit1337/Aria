@@ -1,6 +1,3 @@
-from app.agent.tools.web_search import web_search
-from app.agent.tools.calculator import calculator
+from app.agent.tools.registry import get_all_tools
 
-tools = [web_search, calculator]
-
-__all__ = ["web_search", "calculator", "tools"]
+__all__ = ["get_all_tools"]
