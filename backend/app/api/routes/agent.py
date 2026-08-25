@@ -1,196 +1,158 @@
 """
-Agent endpoints:
-- POST /agent/run        — standard JSON response
-- POST /agent/run/stream — SSE streaming response
+Agent API routes.
+  POST /agent/run              — synchronous JSON response
+  POST /agent/run/stream       — SSE streaming
+  GET  /agent/status/{sid}     — live run state from Redis
+  GET  /agent/runs/{sid}       — all past runs for a session
+  GET  /agent/runs/id/{rid}    — single run detail
+  POST /agent/run/{rid}/cancel — cancel a running agent
 """
 
 import asyncio
 import json
+import logging
 import uuid
-from typing import AsyncGenerator
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
-from langchain.agents import AgentExecutor
 from sqlalchemy.ext.asyncio import AsyncSession
+from pydantic import BaseModel
 
 from app.database import get_db
-from app.models.session import Session
-from app.models.message import Message
-from app.models.agent_run import AgentRun
-from app.schemas.agent import AgentRunRequest, AgentRunResponse
-from app.agent.core import get_agent_executor
+from app.agent.core import run_agent
 from app.agent.callbacks import StreamingCallbackHandler
-from app.agent.memory import get_long_term_context, PostgresChatMessageHistory
+from app.agent import state as run_state
+from app.agent import audit
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-async def _get_or_create_session(
-    db: AsyncSession, session_id: uuid.UUID | None
-) -> Session:
-    """Return existing session or create a new one."""
-    if session_id:
-        result = await db.get(Session, session_id)
-        if result and result.is_active:
-            return result
-    session = Session(user_id="default", title="New Chat")
-    db.add(session)
-    await db.commit()
-    await db.refresh(session)
-    return session
+# ── request / response schemas ───────────────────────────────────────
+
+class AgentRunRequest(BaseModel):
+    session_id: uuid.UUID
+    input: str
 
 
-async def _run_agent_and_save(
-    db: AsyncSession,
-    session: Session,
-    user_input: str,
-    long_term_ctx: str,
-    callbacks: list | None = None,
-) -> dict:
-    """Core agent execution + DB persistence. Returns result dict."""
-    # Save user message
-    user_msg = Message(session_id=session.id, role="user", content=user_input)
-    db.add(user_msg)
-    await db.commit()
-    await db.refresh(user_msg)
+class AgentStatusResponse(BaseModel):
+    session_id: str
+    run_id: Optional[str] = None
+    status: Optional[str] = None
+    current_step: int = 0
+    tools_called: list[str] = []
+    started_at: Optional[str] = None
+    input: Optional[str] = None
 
-    # Fetch chat history manually (100% async)
-    chat_hist = PostgresChatMessageHistory(session_id=session.id, db=db, k=10)
-    history_messages = await chat_hist.aget_messages()
 
-    # Build executor
-    executor: AgentExecutor = get_agent_executor(db=db, session_id=session.id)
+# ── POST /agent/run ──────────────────────────────────────────────────
 
-    # Initialize defaults for error handling
-    output = ""
-    status = "failed"
-    error = None
-    tools_used = []
-    reasoning = []
-
-    # Run agent
+@router.post("/run")
+async def agent_run(req: AgentRunRequest, db: AsyncSession = Depends(get_db)):
+    run_id = uuid.uuid4()
     try:
-        result = await executor.ainvoke(
-            {
-                "input": user_input,
-                "chat_history": history_messages,
-                "long_term_context": long_term_ctx,
-            },
-            config={"callbacks": callbacks} if callbacks else None,
+        result = await run_agent(
+            session_id=req.session_id,
+            run_id=run_id,
+            user_input=req.input,
+            db=db,
         )
-        output = result.get("output", "")
-        status = "completed"
-        
-        intermediate = result.get("intermediate_steps", [])
-        tools_used = [step[0].tool for step in intermediate] if intermediate else []
-        reasoning = [
-            {"tool": step[0].tool, "input": step[0].tool_input, "observation": str(step[1])}
-            for step in intermediate
-        ] if intermediate else []
-    except Exception as e:
-        error = str(e)
-        result = {}
-
-    # Save assistant message
-    if output:
-        asst_msg = Message(session_id=session.id, role="assistant", content=output)
-        db.add(asst_msg)
-
-    # Save agent run trace
-    agent_run = AgentRun(
-        session_id=session.id,
-        message_id=user_msg.id,
-        status=status,
-        input=user_input,
-        output=output,
-        reasoning_trace=reasoning,
-        tools_used=tools_used,
-        error=error,
-    )
-    db.add(agent_run)
-    await db.commit()
-    await db.refresh(agent_run)
+    except RuntimeError as exc:
+        if "already running" in str(exc):
+            raise HTTPException(status_code=409, detail=str(exc))
+        raise HTTPException(status_code=500, detail=str(exc))
 
     return {
-        "session_id": str(session.id),
-        "run_id": str(agent_run.id),
-        "output": output,
-        "status": status,
-        "tools_used": tools_used,
-        "reasoning_trace": reasoning,
+        "run_id": str(run_id),
+        "session_id": str(req.session_id),
+        **result,
     }
 
 
-# ── Standard endpoint ──────────────────────────────────────────────
-
-@router.post("/run", response_model=AgentRunResponse)
-async def run_agent(
-    req: AgentRunRequest,
-    db: AsyncSession = Depends(get_db),
-):
-    session = await _get_or_create_session(db, req.session_id)
-    long_term_ctx = await get_long_term_context(db, req.message)
-    result = await _run_agent_and_save(db, session, req.message, long_term_ctx)
-    return AgentRunResponse(**result)
-
-
-# ── SSE Streaming endpoint ─────────────────────────────────────────
-
-async def _sse_event_stream(
-    db: AsyncSession,
-    session: Session,
-    user_input: str,
-    long_term_ctx: str,
-) -> AsyncGenerator[str, None]:
-    """Yields SSE-formatted JSON lines from the agent run."""
-    queue: asyncio.Queue = asyncio.Queue()
-    handler = StreamingCallbackHandler(queue)
-
-    # Launch agent in background
-    task = asyncio.create_task(
-        _run_agent_and_save(
-            db=db,
-            session=session,
-            user_input=user_input,
-            long_term_ctx=long_term_ctx,
-            callbacks=[handler],
-        )
-    )
-
-    # Stream events until the task completes
-    while not task.done():
-        try:
-            event = await asyncio.wait_for(queue.get(), timeout=0.5)
-            yield f"data: {json.dumps(event, default=str)}\n\n"
-        except asyncio.TimeoutError:
-            continue
-
-    # Drain remaining events
-    while not queue.empty():
-        event = queue.get_nowait()
-        yield f"data: {json.dumps(event, default=str)}\n\n"
-
-    # Final result
-    try:
-        result = task.result()
-        yield f"data: {json.dumps({'event': 'done', 'data': result}, default=str)}\n\n"
-    except Exception as e:
-        yield f"data: {json.dumps({'event': 'error', 'data': {'error': str(e)}}, default=str)}\n\n"
-
-    yield "data: [DONE]\n\n"
-
+# ── POST /agent/run/stream ──────────────────────────────────────────
 
 @router.post("/run/stream")
-async def run_agent_stream(
-    req: AgentRunRequest,
-    db: AsyncSession = Depends(get_db),
-):
-    session = await _get_or_create_session(db, req.session_id)
-    long_term_ctx = await get_long_term_context(db, req.message)
+async def agent_run_stream(req: AgentRunRequest, db: AsyncSession = Depends(get_db)):
+    run_id = uuid.uuid4()
+
+    # Pre-check concurrency
+    slot = await run_state.try_acquire(str(req.session_id), str(run_id), req.input)
+    if not slot:
+        raise HTTPException(
+            status_code=409,
+            detail="Agent is already running for this session.",
+        )
+    # Release the slot — run_agent will re-acquire it properly
+    await run_state.release(str(req.session_id))
+
+    queue: asyncio.Queue = asyncio.Queue()
+    handler = StreamingCallbackHandler(queue=queue, run_id=run_id)
+
+    async def event_generator():
+        # Launch agent in background
+        task = asyncio.create_task(
+            run_agent(
+                session_id=req.session_id,
+                run_id=run_id,
+                user_input=req.input,
+                db=db,
+                callback_handler=handler,
+            )
+        )
+
+        try:
+            while True:
+                # Check cancellation every iteration
+                if await run_state.is_cancelled(str(run_id)):
+                    yield _sse("done", {"status": "cancelled"})
+                    task.cancel()
+                    break
+
+                try:
+                    msg = await asyncio.wait_for(queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    if task.done():
+                        break
+                    continue
+
+                event_type = msg.get("event", "token")
+                data = msg.get("data", "")
+
+                if event_type == "agent_finish":
+                    yield _sse(event_type, data)
+                    # Drain remaining tokens
+                    while not queue.empty():
+                        leftover = queue.get_nowait()
+                        yield _sse(leftover["event"], leftover["data"])
+                    break
+
+                if event_type == "error":
+                    yield _sse("error", data)
+                    break
+
+                yield _sse(event_type, data)
+
+            # Wait for task to fully complete (audit writes, etc.)
+            try:
+                result = await asyncio.wait_for(task, timeout=10.0)
+                yield _sse("done", {
+                    "run_id": str(run_id),
+                    "status": result.get("status", "completed"),
+                    "token_usage": result.get("token_usage", {}),
+                })
+            except asyncio.CancelledError:
+                yield _sse("done", {"run_id": str(run_id), "status": "cancelled"})
+            except Exception as exc:
+                yield _sse("done", {"run_id": str(run_id), "status": "failed", "error": str(exc)})
+
+        except Exception as exc:
+            logger.exception("SSE generator error")
+            yield _sse("error", str(exc))
+            yield _sse("done", {"status": "error"})
 
     return StreamingResponse(
-        _sse_event_stream(db, session, req.message, long_term_ctx),
+        event_generator(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -198,3 +160,81 @@ async def run_agent_stream(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+# ── GET /agent/status/{session_id} ───────────────────────────────────
+
+@router.get("/status/{session_id}", response_model=AgentStatusResponse)
+async def agent_status(session_id: str):
+    state = await run_state.get(session_id)
+    if not state:
+        return AgentStatusResponse(session_id=session_id, status="idle")
+    return AgentStatusResponse(**state)
+
+
+# ── GET /agent/runs/{session_id} ─────────────────────────────────────
+
+@router.get("/runs/{session_id}")
+async def get_session_runs(
+    session_id: uuid.UUID,
+    limit: int = 50,
+    offset: int = 0,
+    db: AsyncSession = Depends(get_db),
+):
+    runs = await audit.get_runs_for_session(db, session_id, limit=limit, offset=offset)
+    return {
+        "session_id": str(session_id),
+        "count": len(runs),
+        "runs": [_run_summary(r) for r in runs],
+    }
+
+
+# ── GET /agent/runs/id/{run_id} ──────────────────────────────────────
+
+@router.get("/runs/id/{run_id}")
+async def get_run_detail(
+    run_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    run = await audit.get_run_by_id(db, run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return _run_detail(run)
+
+
+# ── POST /agent/run/{run_id}/cancel ──────────────────────────────────
+
+@router.post("/run/{run_id}/cancel")
+async def cancel_run(run_id: uuid.UUID):
+    await run_state.request_cancel(str(run_id))
+    return {"run_id": str(run_id), "status": "cancel_requested"}
+
+
+# ── helpers ──────────────────────────────────────────────────────────
+
+def _sse(event: str, data) -> str:
+    payload = data if isinstance(data, str) else json.dumps(data, default=str)
+    return f"event: {event}\ndata: {payload}\n\n"
+
+
+def _run_summary(r) -> dict:
+    return {
+        "run_id": str(r.id),
+        "session_id": str(r.session_id),
+        "status": r.status,
+        "tools_used": r.tools_used or [],
+        "token_usage": r.token_usage or {},
+        "duration": r.duration,
+        "started_at": r.started_at,
+        "completed_at": r.completed_at,
+    }
+
+
+def _run_detail(r) -> dict:
+    return {
+        **_run_summary(r),
+        "input": r.input,
+        "output": r.output,
+        "reasoning_trace": r.reasoning_trace or [],
+        "error": r.error,
+    }

@@ -1,0 +1,26 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: aria-ingress
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /api(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: aria-backend
+                port:
+                  number: 8000
+          - path: /(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: aria-frontend
+                port:
+                  number: 80

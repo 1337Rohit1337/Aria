@@ -1,0 +1,54 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aria-backend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: aria-backend
+  template:
+    metadata:
+      labels:
+        app: aria-backend
+    spec:
+      containers:
+        - name: backend
+          image: aria-backend:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+          env:
+            - name: DATABASE_URL
+              value: "postgresql+asyncpg://aria:aria_secret_k8s@aria-postgres:5432/aria_db"
+            - name: REDIS_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: aria-config
+                  key: REDIS_URL
+            - name: GROQ_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: aria-secrets
+                  key: GROQ_API_KEY
+            - name: TAVILY_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: aria-secrets
+                  key: TAVILY_API_KEY
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aria-backend
+spec:
+  ports:
+    - port: 8000
+  selector:
+    app: aria-backend
