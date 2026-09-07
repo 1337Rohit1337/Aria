@@ -54,3 +54,4 @@ Thumbs.db
 .vscode/
 *.swp
 *.swo
+k8s/secret.yaml
