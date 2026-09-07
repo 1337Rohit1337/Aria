@@ -1,3 +1,11 @@
+"""
+Aria — FastAPI Application Entry Point.
+Performs health verification checks on PostgreSQL & Redis,
+pre-loads the local sentence-transformer embedding model,
+verifies the presence of the pgvector database extension,
+and cleans up any stale Redis agent run states on startup.
+"""
+
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,7 +26,7 @@ async def lifespan(app: FastAPI):
     Loads models, verifies database, extension, cache dependencies,
     and resets stale agent states.
     """
-    print("\n--- Starting Aria Agent Backend (Week 4) ---")
+    print("\n--- Starting Aria Agent Backend (Production) ---")
     
     # 1. Verify Postgres Connection
     db_ok = await check_db_connection()
@@ -31,7 +39,6 @@ async def lifespan(app: FastAPI):
     redis_ok = await check_redis_connection()
     if redis_ok:
         print("[+] Redis connected successfully.")
-        # Clean up any runs stuck in 'running' state from previous crashes
         cleaned = await cleanup_stale_runs()
         if cleaned:
             print(f"[+] Cleaned up {cleaned} stale agent run(s) from Redis.")
@@ -80,15 +87,15 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS Configuration
-origins = [
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-]
-
+# Robust Production CORS Configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins if not settings.DEBUG else ["*"],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "https://aria-five-phi.vercel.app",
+    ],
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -104,7 +111,6 @@ app.include_router(notes.router, prefix="/notes", tags=["Notes"])
 async def health_check():
     """
     Health check probe endpoint.
-    Used by orchestrators (Docker/K8s) and monitoring tools.
     """
     db_status = await check_db_connection()
     redis_status = await check_redis_connection()
