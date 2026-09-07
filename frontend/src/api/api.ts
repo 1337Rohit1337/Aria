@@ -1,6 +1,7 @@
 import { Session, Message, AgentRun, Note, SSEEvent } from '../types';
 
-const BASE_URL = import.meta.env.VITE_API_URL || '/api';
+const metaEnv = (import.meta as any).env;
+const BASE_URL = (metaEnv && metaEnv.VITE_API_URL) ? metaEnv.VITE_API_URL : '/api';
 
 async function handleResponse<T>(res: Response): Promise<T> {
   if (!res.ok) {
